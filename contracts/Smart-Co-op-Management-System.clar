@@ -9,6 +9,11 @@
 (define-constant err-proposal-not-passed (err u107))
 (define-constant err-invalid-amount (err u108))
 (define-constant err-invalid-duration (err u109))
+(define-constant reputation-proposal-creation u10)
+(define-constant reputation-voting u5)
+(define-constant reputation-execution u15)
+(define-constant reputation-decay-rate u1)
+(define-constant max-reputation u1000)
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var total-pool-funds uint u0)
@@ -195,3 +200,80 @@
 
 (define-read-only (get-next-proposal-id)
   (var-get next-proposal-id))
+
+
+(define-data-var total-reputation-points uint u0)
+
+(define-map member-reputation principal
+  {
+    points: uint,
+    last-activity-block: uint,
+    proposals-created: uint,
+    votes-cast: uint,
+    proposals-executed: uint
+  })
+
+(define-private (calculate-voting-weight (member principal))
+  (let ((member-data (unwrap! (map-get? members member) u0))
+        (reputation-data (default-to 
+          {points: u0, last-activity-block: u0, proposals-created: u0, votes-cast: u0, proposals-executed: u0}
+          (map-get? member-reputation member)))
+        (contribution-weight (/ (get contribution member-data) u1000))
+        (reputation-weight (/ (get points reputation-data) u10)))
+    (+ contribution-weight reputation-weight)))
+
+(define-private (update-member-reputation (member principal) (points-to-add uint) (activity-type (string-ascii 20)))
+  (let ((current-reputation (default-to 
+          {points: u0, last-activity-block: u0, proposals-created: u0, votes-cast: u0, proposals-executed: u0}
+          (map-get? member-reputation member)))
+        (decayed-points (decay-reputation-points (get points current-reputation) (get last-activity-block current-reputation)))
+        (new-points (if (> (+ decayed-points points-to-add) max-reputation)
+                       max-reputation
+                       (+ decayed-points points-to-add))))
+    (map-set member-reputation member
+      (merge current-reputation 
+        {
+          points: new-points,
+          last-activity-block: stacks-block-height,
+          proposals-created: (if (is-eq activity-type "proposal") 
+                               (+ (get proposals-created current-reputation) u1)
+                               (get proposals-created current-reputation)),
+          votes-cast: (if (is-eq activity-type "vote")
+                        (+ (get votes-cast current-reputation) u1)
+                        (get votes-cast current-reputation)),
+          proposals-executed: (if (is-eq activity-type "execution")
+                                (+ (get proposals-executed current-reputation) u1)
+                                (get proposals-executed current-reputation))
+        }))
+    (var-set total-reputation-points (+ (- (var-get total-reputation-points) (get points current-reputation)) new-points))
+    new-points))
+(define-private (decay-reputation-points (current-points uint) (last-activity-block uint))
+  (let ((blocks-since-activity (- stacks-block-height last-activity-block))
+        (decay-amount (* (/ blocks-since-activity u1000) reputation-decay-rate)))
+    (if (> decay-amount current-points) u0 (- current-points decay-amount))))
+
+(define-public (vote-on-proposal-weighted (proposal-id uint) (vote-for bool))
+  (let ((sender tx-sender)
+        (member-data (unwrap! (map-get? members sender) err-not-member))
+        (proposal-data (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+        (voting-weight (calculate-voting-weight sender)))
+    (asserts! (get active member-data) err-not-member)
+    (asserts! (<= stacks-block-height (get expires-at proposal-data)) err-proposal-expired)
+    (asserts! (is-none (map-get? votes {proposal-id: proposal-id, voter: sender})) err-already-voted)
+    (map-set votes {proposal-id: proposal-id, voter: sender} vote-for)
+    (update-member-reputation sender reputation-voting "vote")
+    (if vote-for
+      (map-set proposals proposal-id
+        (merge proposal-data {votes-for: (+ (get votes-for proposal-data) voting-weight)}))
+      (map-set proposals proposal-id
+        (merge proposal-data {votes-against: (+ (get votes-against proposal-data) voting-weight)})))
+    (ok voting-weight)))
+
+(define-read-only (get-member-reputation (member principal))
+  (map-get? member-reputation member))
+
+(define-read-only (get-member-voting-weight (member principal))
+  (calculate-voting-weight member))
+
+(define-read-only (get-total-reputation-points)
+  (var-get total-reputation-points))
