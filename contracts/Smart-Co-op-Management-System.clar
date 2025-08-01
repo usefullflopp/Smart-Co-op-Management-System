@@ -15,6 +15,15 @@
 (define-constant reputation-decay-rate u1)
 (define-constant max-reputation u1000)
 
+(define-constant escrow-fee-rate u50)
+(define-constant err-escrow-not-found (err u200))
+(define-constant err-escrow-already-funded (err u201))
+(define-constant err-escrow-not-funded (err u202))
+(define-constant err-unauthorized-escrow-action (err u203))
+(define-constant err-escrow-already-released (err u204))
+
+(define-data-var next-escrow-id uint u1)
+
 (define-data-var next-proposal-id uint u1)
 (define-data-var total-pool-funds uint u0)
 (define-data-var member-count uint u0)
@@ -277,3 +286,72 @@
 
 (define-read-only (get-total-reputation-points)
   (var-get total-reputation-points))
+
+
+(define-map escrows uint
+  {
+    payer: principal,
+    payee: principal,
+    amount: uint,
+    funded: bool,
+    released: bool,
+    created-at: uint,
+    expires-at: uint,
+    description: (string-ascii 200)
+  })
+
+(define-public (create-escrow (payee principal) (amount uint) (duration uint) (description (string-ascii 200)))
+  (let ((sender tx-sender)
+        (escrow-id (var-get next-escrow-id)))
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (> duration u0) err-invalid-duration)
+    (map-set escrows escrow-id
+      {
+        payer: sender,
+        payee: payee,
+        amount: amount,
+        funded: false,
+        released: false,
+        created-at: stacks-block-height,
+        expires-at: (+ stacks-block-height duration),
+        description: description
+      })
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)))
+
+(define-public (fund-escrow (escrow-id uint))
+  (let ((sender tx-sender)
+        (escrow-data (unwrap! (map-get? escrows escrow-id) err-escrow-not-found)))
+    (asserts! (is-eq sender (get payer escrow-data)) err-unauthorized-escrow-action)
+    (asserts! (not (get funded escrow-data)) err-escrow-already-funded)
+    (asserts! (<= stacks-block-height (get expires-at escrow-data)) err-proposal-expired)
+    (try! (stx-transfer? (get amount escrow-data) sender (as-contract tx-sender)))
+    (map-set escrows escrow-id (merge escrow-data {funded: true}))
+    (ok true)))
+
+(define-public (release-escrow (escrow-id uint))
+  (let ((sender tx-sender)
+        (escrow-data (unwrap! (map-get? escrows escrow-id) err-escrow-not-found))
+        (fee-amount (/ (* (get amount escrow-data) escrow-fee-rate) u10000))
+        (payout-amount (- (get amount escrow-data) fee-amount)))
+    (asserts! (or (is-eq sender (get payer escrow-data)) (is-eq sender (get payee escrow-data))) err-unauthorized-escrow-action)
+    (asserts! (get funded escrow-data) err-escrow-not-funded)
+    (asserts! (not (get released escrow-data)) err-escrow-already-released)
+    (try! (as-contract (stx-transfer? payout-amount tx-sender (get payee escrow-data))))
+    (var-set total-pool-funds (+ (var-get total-pool-funds) fee-amount))
+    (map-set escrows escrow-id (merge escrow-data {released: true}))
+    (ok payout-amount)))
+
+(define-public (refund-escrow (escrow-id uint))
+  (let ((sender tx-sender)
+        (escrow-data (unwrap! (map-get? escrows escrow-id) err-escrow-not-found)))
+    (asserts! (is-eq sender (get payer escrow-data)) err-unauthorized-escrow-action)
+    (asserts! (get funded escrow-data) err-escrow-not-funded)
+    (asserts! (not (get released escrow-data)) err-escrow-already-released)
+    (asserts! (> stacks-block-height (get expires-at escrow-data)) err-proposal-expired)
+    (try! (as-contract (stx-transfer? (get amount escrow-data) tx-sender (get payer escrow-data))))
+    (map-set escrows escrow-id (merge escrow-data {released: true}))
+    (ok (get amount escrow-data))))
+
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrows escrow-id))
