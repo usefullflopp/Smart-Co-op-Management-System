@@ -28,6 +28,13 @@
 (define-data-var total-pool-funds uint u0)
 (define-data-var member-count uint u0)
 
+(define-constant err-milestone-not-found (err u300))
+(define-constant err-milestone-completed (err u301))
+(define-constant err-insufficient-approvals (err u302))
+(define-constant err-unauthorized-milestone-action (err u303))
+
+(define-data-var next-milestone-id uint u1)
+
 (define-map members principal 
   {
     contribution: uint,
@@ -355,3 +362,78 @@
 
 (define-read-only (get-escrow (escrow-id uint))
   (map-get? escrows escrow-id))
+
+
+(define-map milestones uint
+  {
+    project-name: (string-ascii 100),
+    creator: principal,
+    total-funding: uint,
+    released-funding: uint,
+    target-block: uint,
+    completed: bool,
+    approvals: uint,
+    required-approvals: uint,
+    created-at: uint
+  })
+
+(define-map milestone-approvals {milestone-id: uint, approver: principal} bool)
+
+(define-public (create-milestone (project-name (string-ascii 100)) (total-funding uint) (duration uint) (required-approvals uint))
+  (let ((sender tx-sender)
+        (milestone-id (var-get next-milestone-id))
+        (member-data (unwrap! (map-get? members sender) err-not-member)))
+    (asserts! (get active member-data) err-not-member)
+    (asserts! (> total-funding u0) err-invalid-amount)
+    (asserts! (> duration u0) err-invalid-duration)
+    (asserts! (>= (var-get total-pool-funds) total-funding) err-insufficient-funds)
+    (try! (stx-transfer? total-funding sender (as-contract tx-sender)))
+    (map-set milestones milestone-id
+      {
+        project-name: project-name,
+        creator: sender,
+        total-funding: total-funding,
+        released-funding: u0,
+        target-block: (+ stacks-block-height duration),
+        completed: false,
+        approvals: u0,
+        required-approvals: required-approvals,
+        created-at: stacks-block-height
+      })
+    (var-set total-pool-funds (+ (var-get total-pool-funds) total-funding))
+    (var-set next-milestone-id (+ milestone-id u1))
+    (update-member-reputation sender reputation-proposal-creation "milestone")
+    (ok milestone-id)))
+
+(define-public (approve-milestone (milestone-id uint))
+  (let ((sender tx-sender)
+        (member-data (unwrap! (map-get? members sender) err-not-member))
+        (milestone-data (unwrap! (map-get? milestones milestone-id) err-milestone-not-found)))
+    (asserts! (get active member-data) err-not-member)
+    (asserts! (not (get completed milestone-data)) err-milestone-completed)
+    (asserts! (is-none (map-get? milestone-approvals {milestone-id: milestone-id, approver: sender})) err-already-voted)
+    (map-set milestone-approvals {milestone-id: milestone-id, approver: sender} true)
+    (map-set milestones milestone-id
+      (merge milestone-data {approvals: (+ (get approvals milestone-data) u1)}))
+    (update-member-reputation sender reputation-voting "approval")
+    (ok true)))
+
+(define-public (complete-milestone (milestone-id uint))
+  (let ((milestone-data (unwrap! (map-get? milestones milestone-id) err-milestone-not-found)))
+    (asserts! (not (get completed milestone-data)) err-milestone-completed)
+    (asserts! (>= (get approvals milestone-data) (get required-approvals milestone-data)) err-insufficient-approvals)
+    (asserts! (>= stacks-block-height (get target-block milestone-data)) err-proposal-expired)
+    (try! (as-contract (stx-transfer? (get total-funding milestone-data) tx-sender (get creator milestone-data))))
+    (map-set milestones milestone-id (merge milestone-data {completed: true, released-funding: (get total-funding milestone-data)}))
+    (var-set total-pool-funds (- (var-get total-pool-funds) (get total-funding milestone-data)))
+    (update-member-reputation (get creator milestone-data) reputation-execution "completion")
+    (ok (get total-funding milestone-data))))
+
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? milestones milestone-id))
+
+(define-read-only (get-milestone-approval (milestone-id uint) (approver principal))
+  (map-get? milestone-approvals {milestone-id: milestone-id, approver: approver}))
+
+(define-read-only (get-next-milestone-id)
+  (var-get next-milestone-id))
