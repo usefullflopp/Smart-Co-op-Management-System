@@ -22,6 +22,12 @@
 (define-constant err-unauthorized-escrow-action (err u203))
 (define-constant err-escrow-already-released (err u204))
 
+(define-constant err-delegation-exists (err u400))
+(define-constant err-delegation-not-found (err u401))
+(define-constant err-cannot-delegate-to-self (err u402))
+(define-constant err-delegate-not-member (err u403))
+(define-constant err-unauthorized-delegate (err u404))
+
 (define-data-var next-escrow-id uint u1)
 
 (define-data-var next-proposal-id uint u1)
@@ -437,3 +443,79 @@
 
 (define-read-only (get-next-milestone-id)
   (var-get next-milestone-id))
+
+
+(define-map delegations principal
+  {
+    delegate: principal,
+    delegated-at: uint,
+    expires-at: uint,
+    active: bool
+  })
+
+(define-private (get-effective-voter (original-voter principal))
+  (let ((delegation-data (map-get? delegations original-voter)))
+    (match delegation-data
+      delegation-info
+        (if (and (get active delegation-info)
+                 (<= stacks-block-height (get expires-at delegation-info)))
+            (get delegate delegation-info)
+            original-voter)
+      original-voter)))
+
+(define-public (delegate-voting-rights (delegate principal) (duration uint))
+  (let ((sender tx-sender)
+        (member-data (unwrap! (map-get? members sender) err-not-member))
+        (delegate-member-data (unwrap! (map-get? members delegate) err-delegate-not-member)))
+    (asserts! (get active member-data) err-not-member)
+    (asserts! (get active delegate-member-data) err-delegate-not-member)
+    (asserts! (not (is-eq sender delegate)) err-cannot-delegate-to-self)
+    (asserts! (> duration u0) err-invalid-duration)
+    (asserts! (is-none (map-get? delegations sender)) err-delegation-exists)
+    (map-set delegations sender
+      {
+        delegate: delegate,
+        delegated-at: stacks-block-height,
+        expires-at: (+ stacks-block-height duration),
+        active: true
+      })
+    (ok true)))
+
+(define-public (revoke-delegation)
+  (let ((sender tx-sender)
+        (delegation-data (unwrap! (map-get? delegations sender) err-delegation-not-found)))
+    (asserts! (get active delegation-data) err-delegation-not-found)
+    (map-set delegations sender (merge delegation-data {active: false}))
+    (ok true)))
+
+(define-public (vote-as-delegate (delegator principal) (proposal-id uint) (vote-for bool))
+  (let ((sender tx-sender)
+        (delegation-data (unwrap! (map-get? delegations delegator) err-delegation-not-found))
+        (delegator-member-data (unwrap! (map-get? members delegator) err-not-member))
+        (proposal-data (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+        (voting-weight (calculate-voting-weight delegator)))
+    (asserts! (get active delegation-data) err-unauthorized-delegate)
+    (asserts! (is-eq sender (get delegate delegation-data)) err-unauthorized-delegate)
+    (asserts! (<= stacks-block-height (get expires-at delegation-data)) err-unauthorized-delegate)
+    (asserts! (get active delegator-member-data) err-not-member)
+    (asserts! (<= stacks-block-height (get expires-at proposal-data)) err-proposal-expired)
+    (asserts! (is-none (map-get? votes {proposal-id: proposal-id, voter: delegator})) err-already-voted)
+    (map-set votes {proposal-id: proposal-id, voter: delegator} vote-for)
+    (update-member-reputation delegator reputation-voting "vote")
+    (if vote-for
+      (map-set proposals proposal-id
+        (merge proposal-data {votes-for: (+ (get votes-for proposal-data) voting-weight)}))
+      (map-set proposals proposal-id
+        (merge proposal-data {votes-against: (+ (get votes-against proposal-data) voting-weight)})))
+    (ok voting-weight)))
+
+(define-read-only (get-delegation (member principal))
+  (map-get? delegations member))
+
+(define-read-only (is-active-delegate (delegate principal) (delegator principal))
+  (match (map-get? delegations delegator)
+    delegation-data
+      (and (is-eq (get delegate delegation-data) delegate)
+           (get active delegation-data)
+           (<= stacks-block-height (get expires-at delegation-data)))
+    false))
