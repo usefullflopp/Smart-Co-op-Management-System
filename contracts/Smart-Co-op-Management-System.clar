@@ -28,6 +28,16 @@
 (define-constant err-delegate-not-member (err u403))
 (define-constant err-unauthorized-delegate (err u404))
 
+(define-constant tier-bronze-threshold u1000000)
+(define-constant tier-silver-threshold u5000000)
+(define-constant tier-gold-threshold u10000000)
+(define-constant tier-platinum-threshold u25000000)
+(define-constant tier-voting-multiplier-bronze u10)
+(define-constant tier-voting-multiplier-silver u15)
+(define-constant tier-voting-multiplier-gold u20)
+(define-constant tier-voting-multiplier-platinum u30)
+(define-constant err-tier-requirement-not-met (err u500))
+
 (define-data-var next-escrow-id uint u1)
 
 (define-data-var next-proposal-id uint u1)
@@ -519,3 +529,77 @@
            (get active delegation-data)
            (<= stacks-block-height (get expires-at delegation-data)))
     false))
+
+
+(define-map member-tiers principal
+  {
+    tier-level: (string-ascii 20),
+    tier-since: uint,
+    last-updated: uint
+  })
+
+(define-private (calculate-member-tier (contribution uint))
+  (if (>= contribution tier-platinum-threshold)
+    "platinum"
+    (if (>= contribution tier-gold-threshold)
+      "gold"
+      (if (>= contribution tier-silver-threshold)
+        "silver"
+        (if (>= contribution tier-bronze-threshold)
+          "bronze"
+          "none")))))
+
+(define-private (get-tier-voting-multiplier (tier (string-ascii 20)))
+  (if (is-eq tier "platinum")
+    tier-voting-multiplier-platinum
+    (if (is-eq tier "gold")
+      tier-voting-multiplier-gold
+      (if (is-eq tier "silver")
+        tier-voting-multiplier-silver
+        (if (is-eq tier "bronze")
+          tier-voting-multiplier-bronze
+          u0)))))
+
+(define-public (update-member-tier)
+  (let ((sender tx-sender)
+        (member-data (unwrap! (map-get? members sender) err-not-member))
+        (current-tier-data (map-get? member-tiers sender))
+        (new-tier (calculate-member-tier (get contribution member-data))))
+    (asserts! (get active member-data) err-not-member)
+    (match current-tier-data
+      existing-tier
+        (map-set member-tiers sender
+          {
+            tier-level: new-tier,
+            tier-since: (if (is-eq (get tier-level existing-tier) new-tier)
+                          (get tier-since existing-tier)
+                          stacks-block-height),
+            last-updated: stacks-block-height
+          })
+      (map-set member-tiers sender
+        {
+          tier-level: new-tier,
+          tier-since: stacks-block-height,
+          last-updated: stacks-block-height
+        }))
+    (ok new-tier)))
+
+(define-read-only (get-member-tier (member principal))
+  (map-get? member-tiers member))
+
+(define-read-only (get-tier-requirements)
+  {
+    bronze: tier-bronze-threshold,
+    silver: tier-silver-threshold,
+    gold: tier-gold-threshold,
+    platinum: tier-platinum-threshold
+  })
+
+(define-read-only (calculate-tier-enhanced-weight (member principal))
+  (let ((member-data (unwrap! (map-get? members member) u0))
+        (tier-data (map-get? member-tiers member))
+        (base-weight (calculate-voting-weight member)))
+    (match tier-data
+      tier-info
+        (+ base-weight (get-tier-voting-multiplier (get tier-level tier-info)))
+      base-weight)))
